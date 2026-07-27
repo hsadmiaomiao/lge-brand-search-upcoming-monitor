@@ -1,10 +1,82 @@
 "use strict";
-const fs=require("fs"),{chromium}=require("playwright"),core=require("./upcoming-monitor-core");
-const URL_=process.env.UPCOMING_WEBHOOK_URL,TOKEN=process.env.UPCOMING_WEBHOOK_TOKEN,DAYS=+(process.env.UPCOMING_DAYS||7),REPORT=process.env.UPCOMING_REPORT_PATH||"upcoming-report.json";
-if(!URL_||!TOKEN)throw new Error("UPCOMING_WEBHOOK_URL and UPCOMING_WEBHOOK_TOKEN GitHub Secrets are required.");
-async function hook(action,payload={}){const r=await fetch(URL_,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:TOKEN,action,...payload})}),b=await r.json();if(!r.ok||b.ok===false)throw new Error(b.message||`Webhook failed: ${r.status}`);return b}
-function options(device){return String(device).toUpperCase().includes("MO")?{viewport:{width:390,height:900},isMobile:true,hasTouch:true,locale:"ko-KR"}:{viewport:{width:1440,height:1000},locale:"ko-KR"}}
-async function links(page){return page.evaluate(()=>{const seen=new Set;return[...document.querySelectorAll('a[href*="ader.naver.com"]')].map((a,i)=>({position:i+1,area:a.closest("li")?"brand-search-list":"brand-search-area",text:(a.innerText||a.getAttribute("aria-label")||a.querySelector("img")?.alt||"image-link").replace(/\s+/g," ").trim(),trackingUrl:a.href,y:a.getBoundingClientRect().top+scrollY})).filter(x=>/[?&]c=(?:naver\.search\.(?:pc|mo)\.brand|mnaver\.search\.brand)(?:&|$)/i.test(x.trackingUrl)&&x.y<=1400).filter(x=>{const k=x.text+"\n"+x.trackingUrl;if(seen.has(k))return false;seen.add(k);return true})})}
-async function landing(ctx,link,now){const p=await ctx.newPage();try{await p.goto(link.trackingUrl,{waitUntil:"domcontentloaded",timeout:30000});const finalUrl=p.url();if(!core.isEventLanding({finalUrl}))return null;const title=await p.title(),text=await p.locator("main, body").first().innerText({timeout:10000}).catch(()=>""),range=core.parseDateRange(text,now),s=core.classifySchedule(range,now,DAYS);return{area:link.area,text:core.normalizeText(link.text),trackingUrl:link.trackingUrl,finalUrl,canonicalUrl:core.canonicalUrl(finalUrl),eventId:core.eventIdFromUrl(finalUrl),eventName:core.normalizeText(title),startDate:core.formatDate(range?.startDate),endDate:core.formatDate(range?.endDate),dateEvidence:range?.evidence||"",status:s.status,daysRemaining:s.daysRemaining}}finally{await p.close()}}
-async function target(browser,t,now){const c=await browser.newContext(options(t.device)),p=await c.newPage();try{await p.goto(t.searchUrl,{waitUntil:"domcontentloaded",timeout:30000});const ls=await links(p),events=[];for(const l of ls){const e=await landing(c,l,now).catch(err=>({area:l.area,text:core.normalizeText(l.text),finalUrl:l.trackingUrl,canonicalUrl:l.trackingUrl,eventId:"",eventName:"CHECK_FAILED",startDate:"CHECK_FAILED",endDate:"CHECK_FAILED",status:"CHECK_FAILED",daysRemaining:null,detail:core.normalizeText(err.message)}));if(e)events.push(e)}const d=[...new Map(events.map(e=>[e.eventId||e.canonicalUrl,e])).values()];return{rowNumber:t.rowNumber,item:t.item,device:t.device,searchUrl:t.searchUrl,checkedLinkCount:ls.length,eventCount:d.length,upcomingCount:d.filter(e=>/^D-\d+$/.test(e.status)).length,events:d}}finally{await c.close()}}
-(async()=>{const now=new Date(),{targets=[]}=await hook("getUpcomingTargets"),b=await chromium.launch({headless:true});try{const results=[];for(const t of targets)results.push(await target(b,t,now));const report={checkedAt:now.toISOString(),thresholdDays:DAYS,results};fs.writeFileSync(REPORT,JSON.stringify(report,null,2));await hook("saveUpcomingResults",report)}finally{await b.close()}})().catch(e=>{console.error(e);process.exitCode=1});
+
+const fs = require("fs");
+const { chromium } = require("playwright");
+const { canonicalUrl, classifySchedule, eventIdFromUrl, formatDate, isEventLanding, normalizeText, parseDateRange } = require("./upcoming-monitor-core");
+
+const WEBHOOK_URL = process.env.UPCOMING_WEBHOOK_URL;
+const WEBHOOK_TOKEN = process.env.UPCOMING_WEBHOOK_TOKEN;
+const THRESHOLD_DAYS = Number(process.env.UPCOMING_DAYS || 7);
+const REPORT_PATH = process.env.UPCOMING_REPORT_PATH || "upcoming-report.json";
+if (!WEBHOOK_URL || !WEBHOOK_TOKEN) throw new Error("UPCOMING_WEBHOOK_URL and UPCOMING_WEBHOOK_TOKEN GitHub Secrets are required.");
+
+async function webhook(action, payload = {}) {
+  const response = await fetch(WEBHOOK_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: WEBHOOK_TOKEN, action, ...payload }) });
+  const body = await response.json();
+  if (!response.ok || body.ok === false) throw new Error(body.message || `Webhook failed: ${response.status}`);
+  return body;
+}
+
+function contextOptions(device) {
+  return String(device).toUpperCase().includes("MO")
+    ? { viewport: { width: 390, height: 900 }, isMobile: true, hasTouch: true, locale: "ko-KR" }
+    : { viewport: { width: 1440, height: 1000 }, locale: "ko-KR" };
+}
+
+async function extractBrandLinks(page) {
+  return page.evaluate(() => {
+    const seen = new Set();
+    return [...document.querySelectorAll('a[href*="ader.naver.com"]')].map((anchor, index) => ({
+      position: index + 1,
+      area: anchor.closest("li") ? "brand-search-list" : "brand-search-area",
+      text: (anchor.innerText || anchor.getAttribute("aria-label") || anchor.querySelector("img")?.alt || "image-link").replace(/\s+/g, " ").trim(),
+      trackingUrl: anchor.href,
+      y: anchor.getBoundingClientRect().top + window.scrollY
+    })).filter(item => /[?&]c=(?:naver\.search\.(?:pc|mo)\.brand|mnaver\.search\.brand)(?:&|$)/i.test(item.trackingUrl))
+      .filter(item => { const key = `${item.text}\n${item.trackingUrl}`; if (seen.has(key)) return false; seen.add(key); return true; });
+  });
+}
+
+async function inspectLanding(context, link, checkedAt) {
+  const page = await context.newPage();
+  try {
+    await page.goto(link.trackingUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const finalUrl = page.url();
+    if (!isEventLanding({ finalUrl })) return null;
+    const title = await page.title();
+    const text = await page.locator("main, body").first().innerText({ timeout: 10000 }).catch(() => "");
+    const range = parseDateRange(text, checkedAt);
+    const schedule = classifySchedule(range, checkedAt, THRESHOLD_DAYS);
+    return { area: link.area, text: normalizeText(link.text), trackingUrl: link.trackingUrl, finalUrl, canonicalUrl: canonicalUrl(finalUrl), eventId: eventIdFromUrl(finalUrl), eventName: normalizeText(title), startDate: formatDate(range?.startDate), endDate: formatDate(range?.endDate), dateEvidence: range?.evidence || "", status: schedule.status, daysRemaining: schedule.daysRemaining };
+  } finally { await page.close(); }
+}
+
+async function inspectTarget(browser, target, checkedAt) {
+  const context = await browser.newContext(contextOptions(target.device));
+  const page = await context.newPage();
+  try {
+    await page.goto(target.searchUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const links = await extractBrandLinks(page);
+    const events = [];
+    for (const link of links) {
+      const event = await inspectLanding(context, link, checkedAt).catch(error => ({ area: link.area, text: normalizeText(link.text), finalUrl: link.trackingUrl, canonicalUrl: link.trackingUrl, eventId: "", eventName: "CHECK_FAILED", startDate: "CHECK_FAILED", endDate: "CHECK_FAILED", status: "CHECK_FAILED", daysRemaining: null, detail: normalizeText(error.message) }));
+      if (event) events.push(event);
+    }
+    const deduped = [...new Map(events.map(event => [event.eventId || event.canonicalUrl, event])).values()];
+    return { rowNumber: target.rowNumber, item: target.item, device: target.device, searchUrl: target.searchUrl, checkedLinkCount: links.length, eventCount: deduped.length, upcomingCount: deduped.filter(event => /^D-\d+$/.test(event.status)).length, events: deduped };
+  } finally { await context.close(); }
+}
+
+async function main() {
+  const checkedAt = new Date();
+  const { targets = [] } = await webhook("getUpcomingTargets");
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const results = [];
+    for (const target of targets) results.push(await inspectTarget(browser, target, checkedAt));
+    const report = { checkedAt: checkedAt.toISOString(), thresholdDays: THRESHOLD_DAYS, results };
+    fs.writeFileSync(REPORT_PATH, JSON.stringify(report, null, 2));
+    await webhook("saveUpcomingResults", report);
+  } finally { await browser.close(); }
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });
