@@ -1,0 +1,34 @@
+name: Brand Search Upcoming Expiration Monitor
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 23 * * 0"
+permissions:
+  contents: read
+concurrency:
+  group: brand-search-upcoming-expiration-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UPCOMING_WEBHOOK_URL: ${{ secrets.UPCOMING_WEBHOOK_URL }}
+      UPCOMING_WEBHOOK_TOKEN: ${{ secrets.UPCOMING_WEBHOOK_TOKEN }}
+      UPCOMING_DAYS: "7"
+      UPCOMING_REPORT_PATH: upcoming-report.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - run: npm run monitor:upcoming
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upcoming-expiration-${{ github.run_id }}
+          path: upcoming-report.json
+          if-no-files-found: ignore
+          retention-days: 30
