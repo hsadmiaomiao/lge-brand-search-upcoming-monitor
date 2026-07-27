@@ -37,7 +37,26 @@ async function extractBrandLinks(page) {
   });
 }
 
-async function inspectLanding(context, link, checkedAt) {
+async function loadBenefitsScheduleIndex(browser, checkedAt) {
+  const context = await browser.newContext(contextOptions("PC"));
+  const page = await context.newPage();
+  try {
+    await page.goto("https://www.lge.co.kr/benefits", { waitUntil: "domcontentloaded", timeout: 30000 });
+    const cards = await page.evaluate(() => [...document.querySelectorAll('a[href*="/benefits/exhibitions/detail-PE"]')].map(anchor => ({
+      href: anchor.href,
+      text: (anchor.innerText || anchor.textContent || "").replace(/\s+/g, " ").trim()
+    })));
+    return Object.fromEntries(cards.map(card => {
+      const eventId = eventIdFromUrl(card.href);
+      const range = parseDateRange(card.text, checkedAt);
+      return eventId && range ? [eventId, range] : null;
+    }).filter(Boolean));
+  } finally {
+    await context.close();
+  }
+}
+
+async function inspectLanding(context, link, checkedAt, benefitsScheduleIndex) {
   const page = await context.newPage();
   try {
     await page.goto(link.trackingUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -45,13 +64,17 @@ async function inspectLanding(context, link, checkedAt) {
     if (!isEventLanding({ finalUrl })) return null;
     const title = await page.title();
     const text = await page.locator("main, body").first().innerText({ timeout: 10000 }).catch(() => "");
-    const range = parseDateRange(text, checkedAt);
+    const eventId = eventIdFromUrl(finalUrl);
+    // The benefits list is the canonical source for an event's published
+    // period. It also covers permanent-looking detail pages whose body does
+    // not display the period at all (for example first-subscription benefits).
+    const range = benefitsScheduleIndex[eventId] || parseDateRange(text, checkedAt);
     const schedule = classifySchedule(range, checkedAt, THRESHOLD_DAYS);
-    return { area: link.area, text: normalizeText(link.text), trackingUrl: link.trackingUrl, finalUrl, canonicalUrl: canonicalUrl(finalUrl), eventId: eventIdFromUrl(finalUrl), eventName: normalizeText(title), startDate: formatDate(range?.startDate), endDate: formatDate(range?.endDate), dateEvidence: range?.evidence || "", status: schedule.status, daysRemaining: schedule.daysRemaining };
+    return { area: link.area, text: normalizeText(link.text), trackingUrl: link.trackingUrl, finalUrl, canonicalUrl: canonicalUrl(finalUrl), eventId, eventName: normalizeText(title), startDate: formatDate(range?.startDate), endDate: formatDate(range?.endDate), dateEvidence: range?.evidence || "", status: schedule.status, daysRemaining: schedule.daysRemaining };
   } finally { await page.close(); }
 }
 
-async function inspectTarget(browser, target, checkedAt) {
+async function inspectTarget(browser, target, checkedAt, benefitsScheduleIndex) {
   const context = await browser.newContext(contextOptions(target.device));
   const page = await context.newPage();
   try {
@@ -59,7 +82,7 @@ async function inspectTarget(browser, target, checkedAt) {
     const links = await extractBrandLinks(page);
     const events = [];
     for (const link of links) {
-      const event = await inspectLanding(context, link, checkedAt).catch(error => ({ area: link.area, text: normalizeText(link.text), finalUrl: link.trackingUrl, canonicalUrl: link.trackingUrl, eventId: "", eventName: "CHECK_FAILED", startDate: "CHECK_FAILED", endDate: "CHECK_FAILED", status: "CHECK_FAILED", daysRemaining: null, detail: normalizeText(error.message) }));
+      const event = await inspectLanding(context, link, checkedAt, benefitsScheduleIndex).catch(error => ({ area: link.area, text: normalizeText(link.text), finalUrl: link.trackingUrl, canonicalUrl: link.trackingUrl, eventId: "", eventName: "CHECK_FAILED", startDate: "CHECK_FAILED", endDate: "CHECK_FAILED", status: "CHECK_FAILED", daysRemaining: null, detail: normalizeText(error.message) }));
       if (event) events.push(event);
     }
     const deduped = [...new Map(events.map(event => [event.eventId || event.canonicalUrl, event])).values()];
@@ -72,8 +95,12 @@ async function main() {
   const { targets = [] } = await webhook("getUpcomingTargets");
   const browser = await chromium.launch({ headless: true });
   try {
+    const benefitsScheduleIndex = await loadBenefitsScheduleIndex(browser, checkedAt).catch(error => {
+      console.warn(`Benefits schedule index unavailable: ${error.message}`);
+      return {};
+    });
     const results = [];
-    for (const target of targets) results.push(await inspectTarget(browser, target, checkedAt));
+    for (const target of targets) results.push(await inspectTarget(browser, target, checkedAt, benefitsScheduleIndex));
     const report = { checkedAt: checkedAt.toISOString(), thresholdDays: THRESHOLD_DAYS, results };
     fs.writeFileSync(REPORT_PATH, JSON.stringify(report, null, 2));
     await webhook("saveUpcomingResults", report);
