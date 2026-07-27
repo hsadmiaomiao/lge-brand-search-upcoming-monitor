@@ -16,11 +16,30 @@ function canonicalUrl(value) {
 }
 
 function eventIdFromUrl(value) {
-  return String(value || "").match(/detail-(PE\d+)/i)?.[1]?.toUpperCase() || "";
+  const url = String(value || "");
+  const peId = url.match(/detail-(PE\d+)/i)?.[1]?.toUpperCase();
+  if (peId) return peId;
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname === "bestshop.lge.co.kr") {
+      const slug = parsed.pathname.replace(/^\/+|\/+$/g, "").replace(/[^a-z0-9]+/gi, "_").toUpperCase();
+      return slug ? `BESTSHOP_${slug}` : "BESTSHOP_EVENT";
+    }
+  } catch {}
+  return "";
 }
 
-function isEventLanding({ finalUrl }) {
-  return /\/benefits\/exhibitions\/detail-PE\d+/i.test(String(finalUrl || ""));
+function isBestshopEventLanding({ finalUrl, pageText = "", listedInEventIndex = false }) {
+  try {
+    const url = new URL(finalUrl);
+    return url.hostname === "bestshop.lge.co.kr" && (listedInEventIndex || /\uC774\uBCA4\uD2B8\s*\uAE30\uAC04/.test(normalizeText(pageText)));
+  } catch {
+    return false;
+  }
+}
+
+function isEventLanding({ finalUrl, pageText = "", listedInEventIndex = false }) {
+  return /\/benefits\/exhibitions\/detail-PE\d+/i.test(String(finalUrl || "")) || isBestshopEventLanding({ finalUrl, pageText, listedInEventIndex });
 }
 
 function dateUtc(year, month, day) {
@@ -29,8 +48,6 @@ function dateUtc(year, month, day) {
 }
 
 function parseDateRange(text, checkedAt = new Date()) {
-  // Supports the LG page format "7.1(weekday) ~ 7.31(weekday)" without
-  // relying on source-file encoding for the weekday characters.
   const source = normalizeText(text).replace(/\([\uC77C\uC6D4\uD654\uC218\uBAA9\uAE08\uD1A0]\)/g, "");
   const full = source.match(/(20\d{2})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})\s*(?:~|\uFF5E|-|to)\s*(20\d{2})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})/i);
   if (full) return { startDate: dateUtc(full[1], full[2], full[3]), endDate: dateUtc(full[4], full[5], full[6]), evidence: full[0] };
@@ -54,4 +71,4 @@ function classifySchedule(range, checkedAt = new Date(), thresholdDays = 7) {
   return { status: "NORMAL", daysRemaining };
 }
 
-module.exports = { canonicalUrl, classifySchedule, eventIdFromUrl, formatDate, isEventLanding, normalizeText, parseDateRange };
+module.exports = { canonicalUrl, classifySchedule, eventIdFromUrl, formatDate, isBestshopEventLanding, isEventLanding, normalizeText, parseDateRange };
