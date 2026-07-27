@@ -11,7 +11,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       UPCOMING_WEBHOOK_URL: ${{ secrets.UPCOMING_WEBHOOK_URL }}
       UPCOMING_WEBHOOK_TOKEN: ${{ secrets.UPCOMING_WEBHOOK_TOKEN }}
